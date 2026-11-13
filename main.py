@@ -1,261 +1,353 @@
 #!/usr/bin/env python3
+"""Coolest-art entry, v2: a bold, clean synthwave / outrun scene.
+
+Composition: a huge gradient sun with crisp horizontal cuts sinking
+behind two neon-rimmed mountain ridges, over a reflective perspective
+grid, under a star field, in a rich indigo-to-magenta palette. Strong
+symmetry, strong contrast, and shapes big enough to stay striking at
+thumbnail size.
+
+Pure Python standard library, no network, fully deterministic.
+Renders one PNG to argv[1] (default /output/entry.png).
+
+Technique: one procedural pass over the framebuffer (sky, sun, ridges,
+floor grid and sun reflection are all analytic), then a small star
+pass, then a vignette. Ridge lines come from integer value noise, so
+the output is byte-identical on every run.
 """
-Make the coolest art - make.fun bounty entry.
-Bold retro synthwave / cyber sunset: neon sun with scanline cuts,
-silhouette mountains, chrome perspective grid, stars, strong contrast.
-Pure Python stdlib only. Manual PNG encoder (zlib + struct).
-Deterministic: fixed hash-based stars, no randomness, no timestamps.
-"""
-import sys
-import os
+
 import math
-import zlib
+import os
 import struct
+import sys
+import zlib
 
 W = 800
 H = 800
-HORIZON = 520
+HORIZON = 512  # y of the horizon line; floor lives below it
 
-fb = bytearray(W * H * 3)
+FR = [0.0] * (W * H)
+FG = [0.0] * (W * H)
+FB = [0.0] * (W * H)
 
-def set_px(x, y, r, g, b):
-    if 0 <= x < W and 0 <= y < H:
-        i = (y * W + x) * 3
-        fb[i] = r; fb[i+1] = g; fb[i+2] = b
+# Sun geometry: one dominant disc, centred on the horizon axis.
+SUN_X = 400.0
+SUN_Y = 478.0
+SUN_R = 205.0
 
-def blend_px(x, y, r, g, b, a):
-    if 0 <= x < W and 0 <= y < H and a > 0:
-        if a >= 1.0:
-            set_px(x, y, r, g, b); return
-        i = (y * W + x) * 3
-        inv = 1.0 - a
-        fb[i]   = int(fb[i] * inv + r * a)
-        fb[i+1] = int(fb[i+1] * inv + g * a)
-        fb[i+2] = int(fb[i+2] * inv + b * a)
 
-def filled_circle(cx, cy, r, color, soft=1.2):
-    cr, cg, cb = color
-    for y in range(max(0,int(cy-r-2)), min(H,int(cy+r+3))):
-        for x in range(max(0,int(cx-r-2)), min(W,int(cx+r+3))):
-            d = math.hypot(x-cx, y-cy)
-            if d <= r - soft:
-                set_px(x, y, cr, cg, cb)
-            elif d <= r + soft:
-                blend_px(x, y, cr, cg, cb, (r+soft-d)/(2*soft))
+def clamp(v, lo=0.0, hi=1.0):
+    return lo if v < lo else hi if v > hi else v
 
-def circle_alpha(cx, cy, r, color, alpha):
-    cr, cg, cb = color
-    for y in range(max(0,int(cy-r-1)), min(H,int(cy+r+2))):
-        for x in range(max(0,int(cx-r-1)), min(W,int(cx+r+2))):
-            if math.hypot(x-cx, y-cy) <= r:
-                blend_px(x, y, cr, cg, cb, alpha)
 
-def polygon(points, color):
-    cr, cg, cb = color
-    xs=[p[0] for p in points]; ys=[p[1] for p in points]
-    x0=int(min(xs)); x1=int(max(xs)); y0=int(min(ys)); y1=int(max(ys))
-    n=len(points)
-    for y in range(max(0,y0), min(H,y1+1)):
-        for x in range(max(0,x0), min(W,x1+1)):
-            inside=False; j=n-1
-            for i in range(n):
-                xi,yi=points[i]; xj,yj=points[j]
-                if ((yi>y)!=(yj>y)) and (x < (xj-xi)*(y-yi)/(yj-yi+1e-9)+xi):
-                    inside=not inside
-                j=i
-            if inside:
-                set_px(x,y,cr,cg,cb)
+def lerp(a, b, t):
+    return a + (b - a) * t
 
-def thick_line(x0,y0,x1,y1,width,color,alpha=1.0):
-    steps=int(max(abs(x1-x0),abs(y1-y0)))+1
-    r=width/2.0
-    for s in range(steps+1):
-        t=s/steps if steps else 0
-        cx=x0+(x1-x0)*t; cy=y0+(y1-y0)*t
-        # small filled circle via bounding box
-        for y in range(max(0,int(cy-r-1)), min(H,int(cy+r+2))):
-            for x in range(max(0,int(cx-r-1)), min(W,int(cx+r+2))):
-                if math.hypot(x-cx,y-cy) <= r:
-                    if alpha>=1.0: set_px(x,y,color[0],color[1],color[2])
-                    else: blend_px(x,y,color[0],color[1],color[2],alpha)
 
-def rect(x0,y0,x1,y1,color):
-    for y in range(max(0,y0), min(H,y1)):
-        for x in range(max(0,x0), min(W,x1)):
-            set_px(x,y,color[0],color[1],color[2])
+def lerp3(c1, c2, t):
+    return (lerp(c1[0], c2[0], t),
+            lerp(c1[1], c2[1], t),
+            lerp(c1[2], c2[2], t))
 
-def lerp(c1,c2,t):
-    return (int(c1[0]+(c2[0]-c1[0])*t), int(c1[1]+(c2[1]-c1[1])*t), int(c1[2]+(c2[2]-c1[2])*t))
 
-def hash2(x,y):
-    # deterministic pseudo-random 0..1 from coords
-    v = math.sin(x*127.1 + y*311.7) * 43758.5453
-    return v - math.floor(v)
+def smooth(t):
+    t = clamp(t)
+    return t * t * (3.0 - 2.0 * t)
 
-# ---------- Scene ----------
-def draw():
-    # Sky gradient: deep indigo -> purple -> magenta, down to horizon
-    sky_stops = [(0.0,(8,4,32)), (0.35,(38,10,68)), (0.62,(92,20,110)),
-                 (0.82,(196,42,120)), (1.0,(255,110,80))]
-    for y in range(HORIZON):
-        t = y/(HORIZON-1)
-        # find segment
-        for i in range(len(sky_stops)-1):
-            t0,c0 = sky_stops[i]; t1,c1 = sky_stops[i+1]
-            if t0 <= t <= t1:
-                col = lerp(c0,c1,(t-t0)/(t1-t0)); break
-        else:
-            col = sky_stops[-1][1]
-        base=y*W*3
-        for x in range(W):
-            i=base+x*3; fb[i]=col[0]; fb[i+1]=col[1]; fb[i+2]=col[2]
-    # Ground base: near-black purple
-    for y in range(HORIZON, H):
-        t=(y-HORIZON)/(H-HORIZON)
-        col=lerp((26,6,44),(6,2,18),t)
-        base=y*W*3
-        for x in range(W):
-            i=base+x*3; fb[i]=col[0]; fb[i+1]=col[1]; fb[i+2]=col[2]
 
-    # Stars (deterministic hash grid, only upper sky, fade near horizon)
-    for gy in range(0, 26):
-        for gx in range(0, 40):
-            h1=hash2(gx,gy); h2=hash2(gx+100,gy+50); h3=hash2(gx+7,gy+200)
-            if h1 > 0.62:
-                sx=int(gx*20 + h2*16); sy=int(gy*16 + h3*12)
-                if sy < 400:
-                    fade = 1.0 - (sy/430.0)
-                    bright = int(120 + 135*h2)
-                    sz = 2 if h1>0.90 else 1
-                    col=(bright, bright, int(bright*(0.85+0.15*h3)))
-                    for dy in range(sz):
-                        for dx in range(sz):
-                            blend_px(sx+dx, sy+dy, col[0],col[1],col[2], 0.35+0.6*fade)
-                    if h1>0.94:  # cross sparkle
-                        for d in (-3,-2,2,3):
-                            blend_px(sx+d, sy, 200,220,255, 0.5*fade)
-                            blend_px(sx, sy+d, 200,220,255, 0.5*fade)
+def gradient(stops, t):
+    """Piecewise-linear colour ramp; stops are (position, colour)."""
+    if t <= stops[0][0]:
+        return stops[0][1]
+    for k in range(1, len(stops)):
+        p1, c1 = stops[k]
+        if t <= p1:
+            p0, c0 = stops[k - 1]
+            return lerp3(c0, c1, (t - p0) / (p1 - p0))
+    return stops[-1][1]
 
-    # Distant city / mountain glow behind sun handled later
 
-    # Sun glow (layered alpha circles)
-    for (r,a) in [(250,0.10),(225,0.12),(205,0.14)]:
-        circle_alpha(400, 430, r, (255,60,140), a)
+SKY_STOPS = [
+    (0.00, (0.012, 0.000, 0.086)),   # deep space indigo
+    (0.30, (0.075, 0.012, 0.263)),
+    (0.52, (0.231, 0.043, 0.427)),
+    (0.64, (0.482, 0.086, 0.478)),   # magenta bloom at the horizon
+]
 
-    # Sun: circle with vertical gradient yellow->orange->magenta, with horizontal cuts increasing toward bottom
-    SUN_CX, SUN_CY, SUN_R = 400, 430, 185
-    # cuts: (y_start_relative, thickness)
-    cuts = [(28,5),(58,7),(88,10),(116,13),(142,17)]
-    for y in range(SUN_CY-SUN_R, SUN_CY+SUN_R):
-        if y<0 or y>=HORIZON+40: continue
-        dy=y-SUN_CY
-        # check cut
-        in_cut=False
-        for (cy0,th) in cuts:
-            if cy0 <= dy < cy0+th:
-                in_cut=True; break
-        if in_cut: continue
-        half=math.sqrt(max(0, SUN_R*SUN_R - dy*dy))
-        t=(dy+SUN_R)/(2*SUN_R)  # 0 top -> 1 bottom
-        if t<0.5:
-            col=lerp((255,230,90),(255,150,50), t*2)
-        else:
-            col=lerp((255,150,50),(255,45,130), (t-0.5)*2)
-        for x in range(int(SUN_CX-half), int(SUN_CX+half)):
-            set_px(x,y,col[0],col[1],col[2])
+SUN_STOPS = [
+    (0.00, (1.000, 0.847, 0.220)),   # hot yellow crown
+    (0.45, (1.000, 0.545, 0.259)),
+    (0.75, (1.000, 0.235, 0.475)),
+    (1.00, (0.937, 0.106, 0.541)),   # magenta base
+]
 
-    # Mountains silhouettes (two ranges)
-    back = [(0,520),(0,452),(90,404),(170,448),(250,392),(340,452),(430,410),(520,462),(610,398),(700,450),(800,420),(800,520)]
-    polygon(back, (42,12,66))
-    # neon rim light on back range: draw offset copy top edge lines
-    for i in range(len(back)-2):
-        thick_line(back[i][0],back[i][1],back[i+1][0],back[i+1][1],2,(255,70,180),alpha=0.85)
-    front = [(0,520),(0,478),(120,438),(230,486),(360,446),(480,492),(600,444),(710,484),(800,462),(800,520)]
-    polygon(front, (14,4,30))
-    for i in range(len(front)-2):
-        thick_line(front[i][0],front[i][1],front[i+1][0],front[i+1][1],2,(0,220,255),alpha=0.75)
-
-    # Horizon neon line
-    rect(0, HORIZON-2, W, HORIZON+2, (255,45,150))
-    rect(0, HORIZON+2, W, HORIZON+4, (0,220,255))
-
-    # Sun reflection shimmer on grid (center column glow)
-    for y in range(HORIZON+4, H):
-        t=(y-HORIZON)/(H-HORIZON)
-        width = 30 + t*180
-        a = 0.16*(1-t)+0.04
-        col = lerp((255,120,60),(255,45,150), t)
-        for x in range(int(400-width), int(400+width)):
-            blend_px(x,y,col[0],col[1],col[2],a)
-
-    # Perspective grid: vertical rays from vanishing point
-    VPX, VPY = 400, HORIZON
-    for i in range(-14, 15):
-        x_bottom = VPX + i*92
-        col = (0,225,255) if i%2==0 else (200,50,255)
-        # glow pass then core pass
-        thick_line(VPX, VPY, x_bottom, H, 5, col, alpha=0.28)
-        thick_line(VPX, VPY, x_bottom, H, 2, col, alpha=1.0)
-    # Horizontal grid lines with exponential spacing (perspective)
-    rows=[]
-    k=0
-    while True:
-        yy = HORIZON + int(6*(1.42**k))
-        if yy>=H: break
-        rows.append(yy); k+=1
-    for idx, yy in enumerate(rows):
-        th = 2 if idx<6 else 3
-        thick_line(0, yy, W, yy, th, (0,225,255), alpha=0.30)  # glow under
-        thick_line(0, yy, W, yy, 1 if idx<6 else 2, (140,240,255), alpha=1.0)
-
-    # Foreground geometric accents: two floating chrome triangles / diamonds (bold composition)
-    # Left diamond outline neon cyan
-    diamond=[(108,168),(148,222),(108,276),(68,222)]
-    for i in range(4):
-        thick_line(diamond[i][0],diamond[i][1],diamond[(i+1)%4][0],diamond[(i+1)%4][1],6,(0,225,255),alpha=0.35)
-        thick_line(diamond[i][0],diamond[i][1],diamond[(i+1)%4][0],diamond[(i+1)%4][1],3,(160,250,255),alpha=1.0)
-    # Right triangle outline neon magenta
-    tri=[(668,140),(724,238),(612,238)]
-    for i in range(3):
-        thick_line(tri[i][0],tri[i][1],tri[(i+1)%3][0],tri[(i+1)%3][1],6,(255,45,150),alpha=0.35)
-        thick_line(tri[i][0],tri[i][1],tri[(i+1)%3][0],tri[(i+1)%3][1],3,(255,170,220),alpha=1.0)
-    # Small filled accent circle top-left
-    filled_circle(688, 96, 10, (255,230,90))
-    filled_circle(116, 84, 7, (255,255,255))
-
-    # Vignette: darken corners deterministically
-    for y in range(H):
-        for x in range(W):
-            dx=(x-400)/400.0; dy=(y-400)/400.0
-            d=dx*dx+dy*dy
-            if d>0.85:
-                a=min(0.42,(d-0.85)*0.55)
-                blend_px(x,y,0,0,10,a)
-
-# ---------- PNG encoder ----------
-def png_chunk(typ, data):
-    c=struct.pack(">I", len(data))+typ+data
-    c+=struct.pack(">I", zlib.crc32(typ+data) & 0xffffffff)
-    return c
 
 def write_png(path):
-    raw=bytearray()
+    raw = bytearray()
     for y in range(H):
         raw.append(0)
-        s=y*W*3
-        raw.extend(fb[s:s+W*3])
-    png=b"\x89PNG\r\n\x1a\n"
-    png+=png_chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
-    png+=png_chunk(b"IDAT", zlib.compress(bytes(raw), 9))
-    png+=png_chunk(b"IEND", b"")
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path,"wb") as f:
-        f.write(png)
+        base = y * W
+        for x in range(W):
+            i = base + x
+            raw.append(int(clamp(FR[i]) * 255.0 + 0.5))
+            raw.append(int(clamp(FG[i]) * 255.0 + 0.5))
+            raw.append(int(clamp(FB[i]) * 255.0 + 0.5))
+    comp = zlib.compress(bytes(raw), 9)
+
+    def chunk(tag, data):
+        body = tag + data
+        return (struct.pack(">I", len(data)) + body
+                + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF))
+
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", comp)
+           + chunk(b"IEND", b""))
+    folder = os.path.dirname(path)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    with open(path, "wb") as fh:
+        fh.write(png)
+
+
+# ---------------------------------------------------------------------------
+# Deterministic integer value noise, used for the mountain ridges and
+# for scattering the stars. No library randomness anywhere: the same
+# integers come out on every machine and every run.
+# ---------------------------------------------------------------------------
+
+def hash01(n):
+    """Integer hash -> [0, 1)."""
+    n = (n * 2654435761) & 0xFFFFFFFF
+    n ^= n >> 15
+    n = (n * 2246822519) & 0xFFFFFFFF
+    n ^= n >> 13
+    return (n & 0xFFFFFF) / 16777216.0
+
+
+def vnoise(x, scale, seed):
+    """Smooth 1-D value noise sampled at pixel coordinate x."""
+    xi = int(x // scale)
+    f = (x - xi * scale) / scale
+    a = hash01(xi + seed * 7919)
+    b = hash01(xi + 1 + seed * 7919)
+    t = f * f * (3.0 - 2.0 * f)
+    return a + (b - a) * t
+
+
+def build_ridges():
+    """Two ridge lines, one y per column. The back ridge sits higher
+    and lighter; the front ridge lower, darker, and chunkier."""
+    back = []
+    front = []
+    for x in range(W):
+        # ridged noise (1 - |2n - 1|) gives peaky crests instead of
+        # rolling hills; a little ordinary noise breaks the regularity
+        peak_b = 1.0 - abs(2.0 * vnoise(x, 62, 3) - 1.0)
+        b = (470.0 - 80.0 * peak_b
+             - 22.0 * vnoise(x, 23, 5) - 6.0 * vnoise(x, 9, 7))
+        peak_f = 1.0 - abs(2.0 * vnoise(x, 48, 11) - 1.0)
+        f = (506.0 - 58.0 * peak_f
+             - 18.0 * vnoise(x, 19, 13) - 5.0 * vnoise(x, 8, 17))
+        back.append(b)
+        front.append(f)
+    return back, front
+
+
+RIDGE_BACK, RIDGE_FRONT = build_ridges()
+
+
+def slit_alpha(y):
+    """How much of the sun is cut away at row y: 0 = solid sun,
+    1 = fully cut. Only the lower half is cut; the cuts widen and
+    thicken as they descend, the classic outrun look. The mask only
+    depends on y, and its edges are anti-aliased over ~2 px."""
+    if y <= SUN_Y + 6:
+        return 0.0
+    u = (y - SUN_Y) / SUN_R            # 0 at centre -> 1 at base
+    f = (u * 9.0) % 1.0                # position inside one band
+    duty = 0.05 + 0.36 * u             # fraction of the band that is cut
+    step_px = 9.0 / SUN_R              # df per pixel of y
+    if f < duty:
+        dist = min(f, duty - f) / step_px
+        return clamp(0.5 + dist)
+    dist = min(f - duty, 1.0 - f) / step_px
+    return clamp(0.5 - dist)
+
+
+def build_stars():
+    """(x, y, radius, brightness) tuples in the sky, kept clear of the
+    sun's disc and denser toward the top of the frame."""
+    stars = []
+    n = 0
+    while len(stars) < 150:
+        n += 1
+        x = hash01(n * 3 + 101) * W
+        y = hash01(n * 3 + 202) ** 1.4 * (HORIZON - 40)
+        d = math.hypot(x - SUN_X, y - SUN_Y)
+        if d < SUN_R + 14:
+            continue
+        r = 0.8 + 1.5 * hash01(n * 3 + 303)
+        b = 0.35 + 0.65 * hash01(n * 3 + 404)
+        stars.append((x, y, r, b))
+    return stars
+
+
+STARS = build_stars()
+
+
+# ---------------------------------------------------------------------------
+# The scene itself.
+# ---------------------------------------------------------------------------
+
+def sky_color(y):
+    return gradient(SKY_STOPS, y / HORIZON)
+
+
+def floor_color(x, y):
+    """The outrun floor: near-black violet, a magenta bloom at the
+    horizon, a glowing perspective grid, and the sun's shimmering
+    reflection running down the middle."""
+    v = y - HORIZON + 1.0                    # 1 at the horizon
+    r = 0.048 + 0.014 * (v / (H - HORIZON))  # faint violet deepening
+    g = 0.004
+    b = 0.105 - 0.035 * (v / (H - HORIZON))
+    bloom = math.exp(-v / 55.0)
+    r += 0.42 * bloom
+    g += 0.07 * bloom
+    b += 0.30 * bloom
+
+    # perspective depth, compressed toward the horizon
+    pz = 900.0 / (v + 24.0)
+    dpz = 900.0 / ((v + 24.0) * (v + 24.0))   # |d(pz)/dy| per pixel
+    fh = (pz * 1.5) % 1.0
+    dh = min(fh, 1.0 - fh)
+    line_h = clamp(1.0 - dh / max(dpz * 1.5 * 1.6, 0.012))
+    u = (x - SUN_X) * pz / 60.0
+    fv = u % 1.0
+    dv = min(fv, 1.0 - fv)
+    du = pz / 60.0                           # du per pixel of x
+    line_v = clamp(1.0 - dv / max(du * 1.7, 0.05))
+    # grid lines converge and dim toward the horizon (pz is large
+    # there) and burn brightest down at the viewer's feet
+    fade = clamp((36.0 - pz) / 30.0)
+    grid = max(line_h, line_v) * fade
+    r += 0.08 * grid
+    g += 0.88 * grid
+    b += 1.00 * grid
+
+    # sun reflection: a warm column that breaks up on the grid lines
+    dx = abs(x - SUN_X)
+    refl = math.exp(-dx / 85.0) * math.exp(-v / 230.0)
+    shimmer = 0.55 + 0.45 * line_h
+    r += 0.95 * refl * shimmer
+    g += 0.27 * refl * shimmer
+    b += 0.40 * refl * shimmer
+    return (r, g, b)
+
+
+def paint_scene():
+    slit = [slit_alpha(y + 0.5) for y in range(H)]
+    for y in range(H):
+        py = y + 0.5
+        base = y * W
+        sky = sky_color(min(py, HORIZON)) if py <= HORIZON else None
+        for x in range(W):
+            px = x + 0.5
+            if py <= HORIZON:
+                col = sky
+            else:
+                col = floor_color(px, py)
+
+            d = math.hypot(px - SUN_X, py - SUN_Y)
+
+            # halo around the sun, added before the ridges so the
+            # mountains bite into it
+            if d > SUN_R:
+                halo = math.exp(-(d - SUN_R) / 105.0)
+                col = (col[0] + 0.52 * halo,
+                       col[1] + 0.14 * halo,
+                       col[2] + 0.30 * halo)
+
+            # mountain ridges with a hot neon rim along the crest;
+            # they stand on the horizon, so they are clipped to the
+            # sky band and never paint over the floor
+            if py <= HORIZON:
+                rb = RIDGE_BACK[x]
+                if py > rb:
+                    t = clamp((py - rb) / 130.0)
+                    col = lerp3((0.262, 0.082, 0.447),
+                                (0.086, 0.016, 0.208), t)
+                    rim = clamp(1.0 - (py - rb) / 2.6)
+                    col = lerp3(col, (0.98, 0.36, 0.66), rim * 0.85)
+                rf = RIDGE_FRONT[x]
+                if py > rf:
+                    t = clamp((py - rf) / 110.0)
+                    col = lerp3((0.165, 0.051, 0.337),
+                                (0.055, 0.012, 0.145), t)
+                    rim = clamp(1.0 - (py - rf) / 3.2)
+                    col = lerp3(col, (0.50, 0.82, 1.00), rim * 0.8)
+
+            # the sun disc itself, on top of everything so far, with
+            # its lower half sliced by the slit mask
+            if d < SUN_R + 1.0:
+                cov = clamp(SUN_R + 0.5 - d)
+                if cov > 0.0:
+                    t = clamp((py - (SUN_Y - SUN_R)) / (2.0 * SUN_R))
+                    sun = gradient(SUN_STOPS, t)
+                    a = cov * (1.0 - slit[y])
+                    if a > 0.0:
+                        ia = 1.0 - a
+                        col = (col[0] * ia + sun[0] * a,
+                               col[1] * ia + sun[1] * a,
+                               col[2] * ia + sun[2] * a)
+
+            i = base + x
+            FR[i] = col[0]
+            FG[i] = col[1]
+            FB[i] = col[2]
+
+
+def paint_stars():
+    for (sx, sy, sr, bright) in STARS:
+        x0 = max(0, int(sx - sr - 2))
+        x1 = min(W - 1, int(sx + sr + 2))
+        y0 = max(0, int(sy - sr - 2))
+        y1 = min(H - 1, int(sy + sr + 2))
+        for y in range(y0, y1 + 1):
+            base = y * W
+            for x in range(x0, x1 + 1):
+                d = math.hypot(x + 0.5 - sx, y + 0.5 - sy)
+                a = clamp(1.0 - d / (sr + 0.8))
+                a = a * a * bright * 0.9
+                if a <= 0.0:
+                    continue
+                i = base + x
+                FR[i] = FR[i] * (1 - a) + a
+                FG[i] = FG[i] * (1 - a) + a * 0.97
+                FB[i] = FB[i] * (1 - a) + a * 1.00
+
+
+def vignette():
+    for y in range(H):
+        dy = (y - H / 2) / (H / 2)
+        base = y * W
+        for x in range(W):
+            dx = (x - W / 2) / (W / 2)
+            v = 1.0 - 0.24 * clamp(dx * dx + dy * dy - 0.45)
+            i = base + x
+            FR[i] *= v
+            FG[i] *= v
+            FB[i] *= v
+
 
 def main():
-    out=sys.argv[1] if len(sys.argv)>1 else "/output/entry.png"
-    draw()
-    write_png(out)
+    path = sys.argv[1] if len(sys.argv) > 1 else "/output/entry.png"
+    paint_scene()
+    paint_stars()
+    vignette()
+    write_png(path)
 
-if __name__=="__main__":
+
+if __name__ == "__main__":
     main()
